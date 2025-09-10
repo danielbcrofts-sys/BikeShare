@@ -1,0 +1,10 @@
+library(tidyverse)
+library(tidymodels)
+library(vroom)
+library(ggplot2)
+library(patchwork)
+
+dat_test <- vroom("test.csv")
+dat_train <- vroom("train.csv")
+glimpse(dat_test)
+glimpse(dat_train)
