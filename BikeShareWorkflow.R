@@ -29,12 +29,16 @@ bike_workflow <- workflow() %>%
   add_model(lin_model) %>%
   fit(data = dat_train)
 
-lin_preds <- predict(bike_workflow, new_data = dat_train)
+lin_preds <- predict(bike_workflow, new_data = dat_test)
 lin_preds <- exp(lin_preds$.pred)
 
 prepped_recipe <- prep(bike_recipe)
 baked_train <- bake(prepped_recipe, new_data = dat_train)
 head(baked_train, 5)
 
-kaggle_submission <- tibble(datetime = dat_test$datetime, count = lin_preds)
+kaggle_submission <- tibble(
+  datetime = as.character(format(dat_test$datetime, "%Y-%m-%d %H:%M:%S")),
+  count = lin_preds
+)
 write.csv(kaggle_submission, "submission2.csv", row.names = FALSE)
+
