@@ -144,4 +144,64 @@ for(i in 1:length(results)) {
 }
 
 
-  
+###TUNING MODELS
+
+
+## Penalized regression model
+preg_model <- linear_reg(
+  penalty = tune(),
+  mixture = tune()
+) %>%
+  set_engine("glmnet") # Function to fit in R
+
+## Set Workflow
+preg_wf <- workflow() %>%
+  add_recipe(bike_recipe) %>%
+  add_model(preg_model)
+
+## Grid of values to tune over
+grid_of_tuning_params <- grid_regular(
+  penalty(),
+  mixture(),
+  levels = 10
+) ## L^2 total tuning possibilities
+
+## Split data for CV
+folds <- vfold_cv(dat_train, v = 5, repeats = 1)
+
+## Run CV
+CV_results <- preg_wf %>%
+  tune_grid(
+    resamples = folds,
+    grid = grid_of_tuning_params,
+    metrics = metric_set(rmse, mae) # Or leave metrics NULL
+  )
+
+## Plot Results (example)
+collect_metrics(CV_results) %>%
+  filter(.metric == "rmse") %>%
+  ggplot(aes(x = penalty, y = mean, color = factor(mixture))) +
+  geom_line()
+
+## Find Best Tuning Parameters
+bestTune <- CV_results %>%
+  select_best(metric = "rmse")
+
+final_wf <- preg_wf %>%
+  finalize_workflow(bestTune) %>%
+  fit(data = dat_train)
+
+## Predict
+final_preds <- final_wf %>%
+  predict(new_data = dat_test)
+
+final_preds <- exp(final_preds$.pred)   # undo log
+final_preds <- pmax(final_preds, 0)     # no negatives
+
+kaggle_submission <- tibble(
+  datetime = as.character(format(dat_test$datetime, "%Y-%m-%d %H:%M:%S")),
+  count = final_preds
+)
+
+write.csv(kaggle_submission, "submission_tuned.csv", row.names = FALSE)
+
