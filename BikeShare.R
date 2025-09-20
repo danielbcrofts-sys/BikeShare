@@ -3,6 +3,7 @@ library(tidymodels)
 library(vroom)
 library(ggplot2)
 library(patchwork)
+library(rpart)
 
 dat_test <- vroom("test.csv")
 dat_train <- vroom("train.csv")
@@ -205,3 +206,65 @@ kaggle_submission <- tibble(
 
 write.csv(kaggle_submission, "submission_tuned.csv", row.names = FALSE)
 
+
+### REGRESSION TREES
+tree_model <- decision_tree(
+  tree_depth = tune(),          # maximum depth of tree
+  cost_complexity = tune(),     # pruning parameter
+  min_n = tune()                # minimum samples per node
+) %>%
+  set_engine("rpart") %>%       # What R function to use
+  set_mode("regression")        # Numeric prediction
+
+## Set Workflow
+tree_wf <- workflow() %>%
+  add_recipe(bike_recipe) %>%   # use your recipe from earlier
+  add_model(tree_model)
+
+## Grid of values to tune over
+grid_tree <- grid_regular(
+  tree_depth(),
+  cost_complexity(),
+  min_n(),
+  levels = 3        # adjust if you want finer search (3^3 = 27 combos)
+)
+
+## Split data for CV
+folds <- vfold_cv(dat_train, v = 5)
+
+## Tune the model
+tree_results <- tree_wf %>%
+  tune_grid(
+    resamples = folds,
+    grid = grid_tree,
+    metrics = metric_set(rmse, mae)
+  )
+
+## Plot results (example for RMSE)
+collect_metrics(tree_results) %>%
+  filter(.metric == "rmse") %>%
+  ggplot(aes(x = tree_depth, y = mean, color = factor(min_n))) +
+  geom_line() +
+  facet_wrap(~cost_complexity)
+
+## Find best tuning parameters
+best_tree <- tree_results %>%
+  select_best(metric = "rmse")
+
+## Final workflow
+final_tree_wf <- tree_wf %>%
+  finalize_workflow(best_tree) %>%
+  fit(data = dat_train)
+
+## Predict on test data
+tree_preds <- predict(final_tree_wf, new_data = dat_test)
+tree_preds <- exp(tree_preds$.pred)   # backtransform log(count) → count
+tree_preds <- pmax(tree_preds, 0)     # no negative counts
+
+## Kaggle submission
+kaggle_tree <- tibble(
+  datetime = as.character(format(dat_test$datetime, "%Y-%m-%d %H:%M:%S")),
+  count = tree_preds
+)
+
+write.csv(kaggle_tree, "tree_submission.csv", row.names = FALSE)
