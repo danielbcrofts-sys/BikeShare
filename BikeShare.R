@@ -4,6 +4,7 @@ library(vroom)
 library(ggplot2)
 library(patchwork)
 library(rpart)
+library(ranger)
 
 dat_test <- vroom("test.csv")
 dat_train <- vroom("train.csv")
@@ -232,7 +233,7 @@ grid_tree <- grid_regular(
 ## Split data for CV
 folds <- vfold_cv(dat_train, v = 5)
 
-## Tune the model
+## Tune  model
 tree_results <- tree_wf %>%
   tune_grid(
     resamples = folds,
@@ -240,7 +241,7 @@ tree_results <- tree_wf %>%
     metrics = metric_set(rmse, mae)
   )
 
-## Plot results (example for RMSE)
+## Plot results 
 collect_metrics(tree_results) %>%
   filter(.metric == "rmse") %>%
   ggplot(aes(x = tree_depth, y = mean, color = factor(min_n))) +
@@ -268,3 +269,63 @@ kaggle_tree <- tibble(
 )
 
 write.csv(kaggle_tree, "tree_submission.csv", row.names = FALSE)
+
+
+
+### RANDOM FOREST
+
+
+## Random forest model
+my_mod <- rand_forest(
+  mtry = tune(),       # number of predictors considered at each split
+  min_n = tune(),      # minimum samples per terminal node
+  trees = 500          # number of trees in the forest
+) %>%
+  set_engine("ranger") %>%   # R package used for fitting
+  set_mode("regression")     # numeric outcome
+
+## Create workflow
+my_wf <- workflow() %>%
+  add_recipe(bike_recipe) %>%  # use the recipe defined earlier
+  add_model(my_mod)
+
+## Grid of values to tune over
+mygrid <- grid_regular(
+  mtry(range = c(2, 6)),      # adjust based on number of predictors
+  min_n(range = c(5, 20)),
+  levels = 3                  # 3^2 = 9 total tuning combinations
+)
+
+## Split data for cross-validation
+folds <- vfold_cv(dat_train, v = 5)
+
+## Tune the model
+CV_results <- my_wf %>%
+  tune_grid(
+    resamples = folds,
+    grid = mygrid,
+    metrics = metric_set(rmse, mae)
+  )
+
+## Find best tuning parameters
+bestTune <- CV_results %>%
+  select_best(metric = "rmse")
+
+## Final workflow with best parameters
+final_wf <- my_wf %>%
+  finalize_workflow(bestTune) %>%
+  fit(data = dat_train)
+
+## Predict on test data
+rf_preds <- predict(final_wf, new_data = dat_test)
+rf_preds <- exp(rf_preds$.pred)       # back-transform log(count)
+rf_preds <- pmax(rf_preds, 0)         # no negative counts
+
+## Kaggle submission
+kaggle_submission <- tibble(
+  datetime = as.character(format(dat_test$datetime, "%Y-%m-%d %H:%M:%S")),
+  count = rf_preds
+)
+
+write.csv(kaggle_submission, "rf_submission.csv", row.names = FALSE)
+
