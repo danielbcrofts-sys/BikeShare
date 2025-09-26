@@ -5,6 +5,9 @@ library(ggplot2)
 library(patchwork)
 library(rpart)
 library(ranger)
+library(bonsai)
+library(lightgbm)
+
 
 dat_test <- vroom("test.csv")
 dat_train <- vroom("train.csv")
@@ -179,11 +182,6 @@ CV_results <- preg_wf %>%
     metrics = metric_set(rmse, mae) # Or leave metrics NULL
   )
 
-## Plot Results (example)
-collect_metrics(CV_results) %>%
-  filter(.metric == "rmse") %>%
-  ggplot(aes(x = penalty, y = mean, color = factor(mixture))) +
-  geom_line()
 
 ## Find Best Tuning Parameters
 bestTune <- CV_results %>%
@@ -240,13 +238,6 @@ tree_results <- tree_wf %>%
     grid = grid_tree,
     metrics = metric_set(rmse, mae)
   )
-
-## Plot results 
-collect_metrics(tree_results) %>%
-  filter(.metric == "rmse") %>%
-  ggplot(aes(x = tree_depth, y = mean, color = factor(min_n))) +
-  geom_line() +
-  facet_wrap(~cost_complexity)
 
 ## Find best tuning parameters
 best_tree <- tree_results %>%
@@ -328,4 +319,65 @@ kaggle_submission <- tibble(
 )
 
 write.csv(kaggle_submission, "rf_submission.csv", row.names = FALSE)
+
+
+###Boosted Trees
+
+## Boosted Tree Model
+my_mod <- boost_tree(
+  tree_depth = tune(),
+  trees = tune(),
+  learn_rate = tune()
+) %>%
+  set_engine("lightgbm") %>%  # or "xgboost"
+  set_mode("regression")
+
+## Workflow with recipe
+my_wf <- workflow() %>%
+  add_recipe(bike_recipe) %>%
+  add_model(my_mod)
+
+## Grid of values to tune over
+mygrid <- grid_regular(
+  tree_depth(),
+  trees(),
+  learn_rate(),
+  levels = 3   # 3^3 = 27 combos
+)
+
+## Set up CV
+folds <- vfold_cv(dat_train, v = 5)
+
+## Tune the model
+CV_results <- my_wf %>%
+  tune_grid(
+    resamples = folds,
+    grid = mygrid,
+    metrics = metric_set(rmse)
+  )
+
+## Find Best Tuning Parameters
+bestTune <- CV_results %>%
+  select_best(metric = "rmse")
+
+## Finalize Workflow and Fit
+final_wf <- my_wf %>%
+  finalize_workflow(bestTune) %>%
+  fit(data = dat_train)
+
+## Predict on Test Data
+boost_preds <- final_wf %>%
+  predict(new_data = dat_test)
+
+boost_preds <- exp(boost_preds$.pred)      # back-transform
+boost_preds <- pmax(boost_preds, 0)        # no negative counts
+
+## Save Submission File
+kaggle_submission <- tibble(
+  datetime = as.character(format(dat_test$datetime, "%Y-%m-%d %H:%M:%S")),
+  count = boost_preds
+)
+
+write.csv(kaggle_submission, "submission_boosted.csv", row.names = FALSE)
+
 
