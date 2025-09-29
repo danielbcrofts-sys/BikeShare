@@ -100,9 +100,10 @@ bike_recipe <- recipe(count ~ ., data = dat_train) %>%
   step_time(datetime, features = "hour") %>%
   step_date(datetime, features = "dow") %>%
   step_rm(datetime) %>%
+  step_novel(all_nominal_predictors()) %>%   # NEW: handle unseen levels
   step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%              # NEW: drop zero-variance cols
   step_normalize(all_numeric_predictors())
-
 
 params <- tibble(
   penalty  = c(0.01, 5, 0.5, 3, 3),
@@ -379,5 +380,44 @@ kaggle_submission <- tibble(
 )
 
 write.csv(kaggle_submission, "submission_boosted.csv", row.names = FALSE)
+
+
+
+### Stacking Models
+
+library(h2o)
+h2o::h2o.init()
+
+prepped_recipe <- prep(bike_recipe)
+baked_train <- bake(prepped_recipe, new_data = dat_train)
+baked_test  <- bake(prepped_recipe, new_data = dat_test)
+
+# Convert baked datasets to H2O frames
+train_h2o <- as.h2o(baked_train)
+test_h2o  <- as.h2o(baked_test)
+
+# Run H2O AutoML on baked features
+auto_model <- h2o.automl(
+  x = setdiff(names(baked_train), "count"),  # all predictors
+  y = "count",
+  training_frame = train_h2o,
+  max_runtime_secs = 300,
+  max_models = 5,
+  seed = 123
+)
+
+# Predict on test set
+preds <- h2o.predict(auto_model@leader, newdata = test_h2o)
+preds <- as.vector(preds)
+preds <- exp(preds)     # back-transform log(count)
+preds <- pmax(preds, 0)
+
+# Kaggle submission
+kaggle_submission <- tibble(
+  datetime = format(dat_test$datetime, "%Y-%m-%d %H:%M:%S"),
+  count = preds
+)
+
+vroom::vroom_write(kaggle_submission, "stacked_submission.csv", delim = ",")
 
 
