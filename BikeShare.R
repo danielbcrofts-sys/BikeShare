@@ -7,6 +7,11 @@ library(rpart)
 library(ranger)
 library(bonsai)
 library(lightgbm)
+library(xgboost)
+library(doParallel)
+library(lubridate)
+library(finetune)
+
 
 
 dat_test <- vroom("test.csv")
@@ -386,8 +391,50 @@ write.csv(kaggle_submission, "submission_boosted.csv", row.names = FALSE)
 ### Stacking Models
 
 library(h2o)
+library(lubridate)
 h2o::h2o.init()
 
+dat_test <- vroom("test.csv")
+dat_train <- vroom("train.csv")
+
+dat_train <- dat_train %>%
+  mutate(
+    hour = hour(datetime),
+    dow = wday(datetime, label = TRUE)
+  )
+
+dat_train <- dat_train %>%
+  select(-casual, -registered) %>%
+  mutate(count = log(count))
+
+dat_test <- dat_test %>%
+  mutate(
+    hour = hour(datetime),
+    dow = wday(datetime, label = TRUE)
+  )
+
+# Recipe
+bike_recipe <- recipe(count ~ ., data = dat_train) %>%
+  # Fix weather 4 → 3
+  step_mutate(
+    weather = ifelse(weather == 4, 3, weather),
+    weather = factor(weather),
+    season = factor(season),
+    holiday = factor(holiday),
+    workingday = factor(workingday)
+  ) %>%
+  # Polynomial on hour to capture morning/evening peaks
+  step_poly(hour, degree = 3) %>%
+  # Interactions between hour and temperature
+  # Dummy code all nominal variables
+  step_dummy(all_nominal_predictors()) %>%
+  # Remove zero variance predictors
+  step_zv(all_predictors()) %>%
+  # Normalize numeric predictors
+  step_normalize(all_numeric_predictors())
+
+
+# Prep and bake
 prepped_recipe <- prep(bike_recipe)
 baked_train <- bake(prepped_recipe, new_data = dat_train)
 baked_test  <- bake(prepped_recipe, new_data = dat_test)
@@ -401,9 +448,9 @@ auto_model <- h2o.automl(
   x = setdiff(names(baked_train), "count"),  # all predictors
   y = "count",
   training_frame = train_h2o,
-  max_runtime_secs = 300,
-  max_models = 5,
-  seed = 123
+  max_runtime_secs = 600,
+  max_models = 15,
+  seed = 12
 )
 
 # Predict on test set
@@ -419,5 +466,190 @@ kaggle_submission <- tibble(
 )
 
 vroom::vroom_write(kaggle_submission, "stacked_submission.csv", delim = ",")
+
+
+
+
+
+###Tweaking recipe for data robot
+
+library(tidymodels)
+library(lubridate)
+
+# 1. Create hour and day-of-week manually to avoid step_time/step_date issues
+dat_train <- dat_train %>%
+  mutate(
+    hour = hour(datetime),
+    dow = wday(datetime, label = TRUE)
+  )
+
+dat_train <- dat_train %>%
+  select(-casual, -registered) %>%
+  mutate(count = log(count))
+
+dat_test <- dat_test %>%
+  mutate(
+    hour = hour(datetime),
+    dow = wday(datetime, label = TRUE)
+  )
+
+# 3. Recipe
+bike_recipe <- recipe(count ~ ., data = dat_train) %>%
+  # Fix weather 4 → 3
+  step_mutate(
+    weather = ifelse(weather == 4, 3, weather),
+    weather = factor(weather),
+    season = factor(season),
+    holiday = factor(holiday),
+    workingday = factor(workingday)
+  ) %>%
+  # Polynomial on hour to capture morning/evening peaks
+  step_poly(hour, degree = 3) %>%
+  # Interactions between hour and temperature
+  step_interact(terms = ~ hour:temp + hour:atemp) %>%
+  # Dummy code all nominal variables
+  step_dummy(all_nominal_predictors()) %>%
+  # Remove zero variance predictors
+  step_zv(all_predictors()) %>%
+  # Normalize numeric predictors
+  step_normalize(all_numeric_predictors())
+
+
+
+#trying again
+prepped_recipe <- prep(bike_recipe)
+baked_train <- bake(prepped_recipe, new_data = dat_train)
+baked_test <- bake(prepped_recipe, new_data = dat_test)
+
+vroom_write(baked_train, "baked_train_v3.csv", delim = ",")
+vroom_write(baked_test, "baked_test_v3.csv", delim = ",")
+
+
+# Load DataRobot predictions
+
+
+dr_preds <- vroom::vroom("data_robot_preds5.csv")
+
+# 2. Back-transform to original scale
+preds <- dr_preds$count_PREDICTION
+
+# Clamp negatives
+preds <- pmax(preds, 0)
+
+# Submission
+kaggle_submission <- tibble(
+  datetime = format(dat_test$datetime, "%Y-%m-%d %H:%M:%S"),
+  count = preds
+)
+# 5. Save CSV
+vroom::vroom_write(kaggle_submission, "datarobot_kaggle_submission5.csv", delim = ",")
+
+
+
+
+
+
+### THE FINAL SUBMISSION BELOW 0.4 HOPEFULLY
+
+
+dat_train <- vroom::vroom("train.csv", show_col_types = FALSE) %>%
+  select(-casual, -registered) %>%
+  mutate(count = log1p(count))
+
+dat_test <- vroom::vroom("./test.csv", show_col_types = FALSE)
+
+#recipe
+bike_recipe <- recipe(count ~ ., data = dat_train) %>%
+  step_mutate(datetime = as.POSIXct(datetime, tz = "UTC")) %>%
+  step_mutate(weather = ifelse(weather == 4, 3, weather)) %>%
+  step_mutate(
+    weather = factor(weather, levels = c(1, 2, 3), labels = c("clear", "mist", "precip")),
+    season = factor(season, levels = c(1, 2, 3, 4), labels = c("spring", "summer", "fall", "winter")),
+    holiday = factor(holiday, levels = c(0, 1), labels = c("no", "yes")),
+    workingday = factor(workingday, levels = c(0, 1), labels = c("no", "yes"))
+  ) %>%
+  step_time(datetime, features = c("hour"), keep_original_cols = TRUE) %>%
+  step_date(datetime, features = c("year", "dow", "month"), keep_original_cols = FALSE) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+# cookies in the oven
+prepped_recipe <- prep(bike_recipe)
+bake(prepped_recipe, new_data = dat_train)
+
+
+#Boost model
+xgb_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(), sample_size = tune(), mtry = tune(),
+  learn_rate = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+#workflow
+xgb_wf <- workflow() %>%
+  add_recipe(bike_recipe) %>%
+  add_model(xgb_spec)
+
+
+# set up parallel processing
+num_cores <- parallel::detectCores(logical = FALSE) - 1
+cl <- makePSOCKcluster(num_cores)
+registerDoParallel(cl)
+
+#tuning grid
+xgb_grid <- grid_space_filling(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), dat_train),
+  learn_rate(),
+  size = 30
+)
+
+#cross-validation
+folds <- vfold_cv(dat_train, v = 5)
+
+# tune the model using the new grid
+race_results <- tune_race_anova(
+  object = xgb_wf,
+  resamples = folds,
+  grid = xgb_grid,
+  metrics = metric_set(rmse),
+  control = control_race(verbose_elim = TRUE)
+)
+
+stopCluster(cl)
+
+
+
+best_xgb <- select_best(race_results, metric = "rmse")
+
+# Finalize workflow
+final_wf <- finalize_workflow(
+  xgb_wf,
+  best_xgb
+)
+
+# fit the model to the training data
+final_fit <- fit(final_wf, data = dat_train)
+
+predictions <- predict(final_fit, new_data = dat_test)
+
+# Create the submission file
+submission <- predictions %>%
+  mutate(.pred = pmax(0, round(expm1(.pred)))) %>% # Inverse log transform
+  rename(count = .pred) %>%
+  bind_cols(dat_test %>% select(datetime)) %>%
+  select(datetime, count) %>%
+  mutate(datetime = format(as.POSIXct(datetime, tz = "UTC"), "%Y-%m-%d %H:%M:%S"))
+
+vroom::vroom_write(submission, "submission_final.csv", delim = ",")
+
+
+
+
 
 
